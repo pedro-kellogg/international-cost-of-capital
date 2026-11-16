@@ -26,6 +26,7 @@ The same tax rate t (U.S. or selected country), debt share w_d and ERP are used 
 from __future__ import annotations
 
 import io
+import json
 import re
 from datetime import datetime, timezone
 
@@ -119,6 +120,26 @@ CURRENCY = {
     "Namibia": "NAD", "Sri Lanka": "LKR", "Bangladesh": "BDT", "Qatar": "QAR",
     "Uganda": "UGX", "Zambia": "ZMW", "Mauritius": "MUR", "Jordan": "JOD", "Kazakhstan": "KZT",
 }
+
+
+# Countries listed on tradingeconomics.com/bonds (slugs), used when the table itself is blocked
+TE_SLUGS = [
+    "united-states", "united-kingdom", "japan", "australia", "germany", "brazil", "russia", "india",
+    "canada", "italy", "france", "south-africa", "china", "switzerland", "mexico", "netherlands",
+    "new-zealand", "portugal", "south-korea", "spain", "greece", "turkey", "finland", "lithuania",
+    "norway", "poland", "romania", "slovakia", "slovenia", "sweden", "hungary", "iceland", "ireland",
+    "austria", "belgium", "croatia", "czech-republic", "denmark", "peru", "chile", "colombia",
+    "singapore", "taiwan", "thailand", "vietnam", "hong-kong", "indonesia", "israel", "malaysia",
+    "pakistan", "philippines", "zambia", "kenya", "nigeria",
+]
+
+
+def slug_to_country(slug: str) -> str:
+    return slug.replace("-", " ").title()
+
+
+def country_to_slug(country: str) -> str:
+    return country.strip().lower().replace(" ", "-")
 
 
 def currency_of(country: str) -> str:
@@ -264,33 +285,59 @@ def parse_ratings_html(html: str) -> tuple[float, str, str]:
 
 
 def parse_te_bonds(html: str) -> pd.DataFrame:
-    """Return DataFrame[Country, Yield, Date] of 10Y yields from tradingeconomics.com/bonds."""
+    """Return DataFrame[Country, Yield, Date] from the tradingeconomics.com/bonds table.
+
+    Rows look like: <tr data-symbol="USGG10YR:IND"> ... <a href="/united-states/government-bond-yield">
+    <b>United States</b></a> ... <td id="p">5.1420</td> ... <td id="date">Nov/16</td>
+    """
     soup = BeautifulSoup(html, "lxml")
     rows = []
     for tr in soup.find_all("tr"):
-        a = tr.find("a", href=re.compile(r"/[^/]+/government-bond-yield"))
+        a = tr.find("a", href=re.compile(r"^/[^/]+/government-bond-yield"))
         if not a:
             continue
-        label = a.get_text(" ", strip=True)
-        if "10Y" not in label.upper():
+        slug = re.search(r"^/([^/]+)/government-bond-yield", a["href"]).group(1)
+        if slug in ("euro-area",):
             continue
-        slug = re.search(r"/([^/]+)/government-bond-yield", a["href"]).group(1)
-        country = slug.replace("-", " ").title()
-        country = {"United States": "United States", "Euro Area": "Euro Area"}.get(country, country)
-        tds = tr.find_all("td")
-        nums = []
-        for td in tds:
-            t = td.get_text(strip=True).replace(",", "").replace("%", "")
-            if re.fullmatch(r"-?\d+(?:\.\d+)?", t):
-                nums.append(float(t))
-        if not nums:
+        name = a.get_text(" ", strip=True) or slug.replace("-", " ").title()
+        p_td = tr.find("td", id="p")
+        if p_td is None:
             continue
-        date_txt = tds[-1].get_text(strip=True) if tds else ""
-        rows.append({"Country": country, "Yield": nums[0] / 100, "Date": date_txt, "TE label": label})
+        txt = p_td.get_text(strip=True).replace("%", "")
+        if not re.fullmatch(r"-?\d+(?:\.\d+)?", txt):
+            continue
+        d_td = tr.find("td", id="date")
+        rows.append({"Country": slug_to_country(slug), "Yield": float(txt) / 100,
+                     "Date": d_td.get_text(strip=True) if d_td else "", "TE label": name})
     df = pd.DataFrame(rows)
     if df.empty:
-        raise ValueError("No 10Y rows parsed from Trading Economics")
+        raise ValueError("No yield rows in the Trading Economics bonds table (page blocked or not rendered)")
     return df.drop_duplicates("Country").reset_index(drop=True)
+
+
+def parse_te_country_page(html: str) -> tuple[float, str]:
+    """Return (10Y yield as decimal, date text) from a /<country>/government-bond-yield page.
+
+    The exact value is in the embedded TEChartsMeta JSON ("last"); the date is in the meta description
+    ("The yield on Colombia 10Y Bond Yield eased to 12.70% on November 13, 2026, ...").
+    """
+    value = None
+    m = re.search(r"TEChartsMeta\s*=\s*(\[.*?\]);", html, re.S)
+    if m:
+        try:
+            meta = json.loads(m.group(1))[0]
+            value = float(meta.get("last", meta.get("value")))
+        except Exception:  # noqa: BLE001
+            value = None
+    soup = BeautifulSoup(html, "lxml")
+    desc_tag = soup.find("meta", attrs={"name": "description"})
+    desc = desc_tag.get("content", "") if desc_tag else ""
+    d = re.search(r"(?:to|at)\s+(-?\d+(?:\.\d+)?)%\s+on\s+([A-Z][a-z]+\s+\d{1,2},\s+\d{4})", desc)
+    if value is None and d:
+        value = float(d.group(1))
+    if value is None:
+        raise ValueError("Yield not found on country page")
+    return value / 100, (d.group(2) if d else "")
 
 
 def parse_oecd_csv(text: str) -> tuple[pd.DataFrame, str]:
@@ -364,26 +411,55 @@ def fetch_tax_rates():
 
 @st.cache_data(ttl=1 * 3600, show_spinner=False)
 def fetch_yields():
-    errors = []
+    """Try the full /bonds table first. Trading Economics loads that table from
+    /bonds?partial=markets, which sits behind an AWS WAF bot challenge (HTTP 202, empty body)
+    for non-browser clients, so the app falls back to per-country pages on demand."""
     try:
-        df = parse_te_bonds(_get(TE_BONDS_URL).text)
-        df["Source"] = "Trading Economics"
-        return dict(df=df, fetched=now_utc(), status="live", error="")
+        with requests.Session() as sess:
+            sess.headers.update(HEADERS)
+            sess.get(TE_BONDS_URL, timeout=25)  # pick up cookies
+            last_err = None
+            for url in (TE_BONDS_URL + "?partial=markets", TE_BONDS_URL):
+                try:
+                    r = sess.get(url, timeout=25, headers={"Referer": TE_BONDS_URL})
+                    if r.status_code != 200 or not r.text.strip():
+                        raise ValueError(f"HTTP {r.status_code} (bot challenge)" if r.status_code == 202
+                                         else f"HTTP {r.status_code}")
+                    df = parse_te_bonds(r.text)
+                    df["Source"] = "Trading Economics (bonds table)"
+                    return dict(df=df, fetched=now_utc(), status="live", mode="table", error="")
+                except Exception as e:  # noqa: BLE001
+                    last_err = e
+            raise last_err
     except Exception as e:  # noqa: BLE001
-        errors.append(f"Trading Economics: {e}")
-    # Fallback: U.S. 10Y from FRED so the default (US vs US) case still works
+        return dict(df=pd.DataFrame(columns=["Country", "Yield", "Date", "TE label", "Source"]),
+                    fetched=now_utc(), status="live", mode="per-country",
+                    error=f"Bonds table unavailable ({e}); using per-country pages.")
+
+
+@st.cache_data(ttl=1 * 3600, show_spinner=False)
+def fetch_country_yield(country: str):
+    """10Y yield for one country from tradingeconomics.com/<slug>/government-bond-yield.
+    Falls back to FRED (DGS10) for the United States."""
+    slug = country_to_slug(country)
+    url = f"https://tradingeconomics.com/{slug}/government-bond-yield"
     try:
-        fred = pd.read_csv(io.StringIO(_get(FRED_US10Y_URL).text))
-        fred.columns = ["Date", "Yield"]
-        fred["Yield"] = pd.to_numeric(fred["Yield"], errors="coerce")
-        last = fred.dropna().iloc[-1]
-        df = pd.DataFrame([{"Country": "United States", "Yield": last["Yield"] / 100,
-                            "Date": str(last["Date"]), "TE label": "DGS10", "Source": "FRED (fallback)"}])
-        return dict(df=df, fetched=now_utc(), status="fallback", error="; ".join(errors))
+        y, date = parse_te_country_page(_get(url).text)
+        return dict(value=y, date=date, source="Trading Economics (country page)", url=url,
+                    fetched=now_utc(), status="live", error="")
     except Exception as e:  # noqa: BLE001
-        errors.append(f"FRED: {e}")
-    return dict(df=pd.DataFrame(columns=["Country", "Yield", "Date", "TE label", "Source"]),
-                fetched=now_utc(), status="failed", error="; ".join(errors))
+        err = f"{url}: {e}"
+    if country == "United States":
+        try:
+            fred = pd.read_csv(io.StringIO(_get(FRED_US10Y_URL).text))
+            fred.columns = ["Date", "Yield"]
+            fred["Yield"] = pd.to_numeric(fred["Yield"], errors="coerce")
+            last = fred.dropna().iloc[-1]
+            return dict(value=last["Yield"] / 100, date=str(last["Date"]), source="FRED DGS10 (fallback)",
+                        url=FRED_US10Y_URL, fetched=now_utc(), status="fallback", error=err)
+        except Exception as e2:  # noqa: BLE001
+            err += f"; FRED: {e2}"
+    return dict(value=np.nan, date="", source="", url=url, fetched=now_utc(), status="failed", error=err)
 
 
 # ----------------------------------------------------------------------------
@@ -393,18 +469,21 @@ def pct(x: float, d: int = 2) -> str:
     return "—" if x is None or (isinstance(x, float) and np.isnan(x)) else f"{x * 100:.{d}f}%"
 
 
-def override_number(label, key, auto_value, help_txt="", fmt_pct=True, min_v=-50.0, max_v=100.0, step=0.01):
-    """Checkbox + number input. Returns (value_used, is_manual)."""
-    on = st.checkbox(f"Override {label}", key=f"ov_{key}", help=help_txt)
-    if fmt_pct:
-        default = 0.0 if auto_value is None or np.isnan(auto_value) else round(auto_value * 100, 4)
-        v = st.number_input(f"{label} (%)", value=default, step=step, min_value=min_v, max_value=max_v,
-                            key=f"in_{key}", disabled=not on, format="%.4f")
-        return (v / 100 if on else auto_value), on
-    default = 1.0 if auto_value is None or np.isnan(auto_value) else round(float(auto_value), 4)
-    v = st.number_input(label, value=default, step=step, min_value=min_v, max_value=max_v,
-                        key=f"in_{key}", disabled=not on, format="%.4f")
-    return (v if on else auto_value), on
+def data_input(label, key, fetched, is_pct=True, min_v=-50.0, max_v=100.0, step=0.01, note="", tag="fetched"):
+    """Number field pre-filled (as a grey placeholder) with the fetched value.
+    Leave it blank to use the fetched value; type a number to override; clear it to go back.
+    Returns (value_used, is_manual)."""
+    have = fetched is not None and not (isinstance(fetched, float) and np.isnan(fetched))
+    shown = (fetched * 100 if is_pct else fetched) if have else None
+    ph = f"{shown:.4f}  ({tag}{note})" if have else "not available — type a value"
+    v = st.number_input(f"{label} (%)" if is_pct else label, value=None, placeholder=ph, key=key,
+                        min_value=min_v, max_value=max_v, step=step, format="%.4f",
+                        help="Blank = use the value shown in grey. Type a number to override; "
+                             "delete it to go back.")
+    if v is None:
+        return (fetched if have else np.nan), False
+    st.caption(f"✏️ Manual — {tag} value: {shown:.4f}" if have else "✏️ Manual")
+    return (v / 100 if is_pct else v), True
 
 
 def status_badge(status: str) -> str:
@@ -440,45 +519,76 @@ def main():
     ind_idx = industries.index(DEFAULT_INDUSTRY) if DEFAULT_INDUSTRY in industries else 0
     industry = sb.selectbox("Industry (Damodaran, U.S.)", industries, index=ind_idx)
 
-    countries = sorted(set(y_map) | set(tax_map) | {DEFAULT_COUNTRY})
+    countries = sorted(set(y_map) | {slug_to_country(x) for x in TE_SLUGS} | set(tax_map) | {DEFAULT_COUNTRY})
     country = sb.selectbox("Target country", countries, index=countries.index(DEFAULT_COUNTRY))
     ccy = currency_of(country)
     if ccy == "USD":  # keep column labels distinct when the target country is the U.S.
         ccy = "USD, target-country basis"
 
-    erp = sb.slider("Equity risk premium (%)", 0.0, 15.0, DEFAULT_ERP, 0.1) / 100
-    w_d = sb.slider("Target debt share D/(D+E) (%)", 0.0, 90.0, DEFAULT_DEBT, 1.0) / 100
+    erp = sb.number_input("Equity risk premium (%)", min_value=0.0, max_value=20.0, value=DEFAULT_ERP,
+                          step=0.1, format="%.2f") / 100
+    w_d = sb.number_input("Target debt share D/(D+E) (%)", min_value=0.0, max_value=95.0, value=DEFAULT_DEBT,
+                          step=1.0, format="%.2f") / 100
 
     tax_choice = sb.radio("Project tax rate", ["U.S. rate", f"{country} rate"], index=0, horizontal=True,
                           help="The same tax rate is applied in both currencies (beta levering and debt tax shield).")
-    method = sb.radio("Currency conversion", ["Exact (multiplicative)", "Additive approximation"], index=0,
-                      help="Exact: (1+k$)(1+y_FC)/(1+y_US)−1.  Additive: k$ + (y_FC − y_US).")
-    method_key = "exact" if method.startswith("Exact") else "additive"
+    method_key = "exact"  # class method: (1 + R*) = (1 + R)(1 + R_f*)/(1 + R_f)
 
-    sb.header("Manual overrides")
+    sb.header("Data inputs")
+    sb.caption("Grey values are fetched. Type over any of them to override; clear the field to go back.")
+    is_us = country == "United States"
     auto_beta = float(beta_df.loc[beta_df["Industry"] == industry, "Unlevered beta"].iloc[0]) \
         if industry in set(beta_df["Industry"]) else np.nan
-    beta_u, ov_beta = override_number("Unlevered beta", "beta", auto_beta, fmt_pct=False, min_v=0.0, max_v=5.0)
+    with sb:
+        beta_u, ov_beta = data_input("Unlevered beta", f"beta|{industry}", auto_beta, is_pct=False,
+                                     min_v=0.0, max_v=5.0)
     if np.isnan(beta_u):
-        sb.error("Beta data unavailable — turn on the beta override.")
+        sb.error("Beta data unavailable — type an unlevered beta.")
         st.stop()
 
-    with sb.expander("Tax rates", expanded=False):
-        t_us, ov_tus = override_number("U.S. tax rate", "tus", tax_map.get("United States", np.nan), min_v=0.0)
-        t_fc, ov_tfc = override_number(f"{country} tax rate", "tfc", tax_map.get(country, np.nan), min_v=0.0)
-    with sb.expander("Spreads", expanded=False):
-        s_usd, ov_susd = override_number("USD BBB spread", "susd", bbb["value"], min_v=0.0)
-        ov_sfc = st.checkbox(f"Override {ccy} BBB spread", key="ov_sfc",
-                             help="If off, the foreign spread is computed automatically from the USD cost of debt.")
-        s_fc_in = st.number_input(f"{ccy} BBB spread (%)", value=1.11, step=0.01, key="in_sfc",
-                                  disabled=not ov_sfc, format="%.4f") / 100
-    with sb.expander("Government 10Y yields", expanded=False):
-        y_us, ov_yus = override_number("U.S. 10Y yield", "yus", y_map.get("United States", np.nan))
-        y_fc, ov_yfc = override_number(f"{country} 10Y yield", "yfc",
-                                       y_us if country == "United States" else y_map.get(country, np.nan))
+    def yield_info(c):
+        if c in y_map:
+            row = y_df.loc[y_df["Country"] == c].iloc[0]
+            return dict(value=float(row["Yield"]), date=str(row["Date"]), source=str(row["Source"]),
+                        url=TE_BONDS_URL, status="live", error="")
+        return fetch_country_yield(c)
 
-    if country == "United States" and not ov_yfc:
-        y_fc = y_us
+    yinfo = {"United States": yield_info("United States")}
+    if not is_us:
+        yinfo[country] = yield_info(country)
+
+    with sb.expander("Corporate tax rates (OECD)", expanded=False):
+        t_us, ov_tus = data_input("U.S. tax rate", "tax|United States", tax_map.get("United States", np.nan),
+                                  min_v=0.0)
+        if is_us:
+            t_fc, ov_tfc = t_us, False
+        else:
+            t_fc, ov_tfc = data_input(f"{country} tax rate", f"tax|{country}", tax_map.get(country, np.nan),
+                                      min_v=0.0)
+
+    with sb.expander("10Y government yields (Trading Economics)", expanded=False):
+        d_us = yinfo["United States"]
+        y_us, ov_yus = data_input("U.S. 10Y yield", "yield|United States", d_us["value"],
+                                  note=f", {d_us['date']}" if d_us.get("date") else "")
+        if is_us:
+            y_fc, ov_yfc = y_us, False
+            st.caption("Selected country is the U.S.: its yield equals the U.S. yield.")
+        else:
+            d_fc = yinfo[country]
+            y_fc, ov_yfc = data_input(f"{country} 10Y yield", f"yield|{country}", d_fc["value"],
+                                      note=f", {d_fc['date']}" if d_fc.get("date") else "")
+        for c, info in yinfo.items():
+            if info["status"] != "failed":
+                st.caption(f"{c}: {info['value']:.4%} · {info['date']} · {info['source']}")
+
+    with sb.expander("BBB borrowing spreads", expanded=False):
+        s_usd, ov_susd = data_input("USD BBB spread", "spread|USD", bbb["value"], min_v=0.0,
+                                    note=f", Damodaran {bbb['as_of']}" if bbb.get("as_of") else "")
+        have_y = not (np.isnan(y_us) or np.isnan(y_fc))
+        s_fc_auto = s_usd * (1 + y_fc) / (1 + y_us) if have_y else np.nan
+        s_fc_val, ov_sfc = data_input(f"{ccy} BBB spread", f"spread|{country}", s_fc_auto, min_v=0.0,
+                                      tag="auto", note=": s × F")
+        s_fc_in = s_fc_val if ov_sfc else None
 
     missing = [n for n, v in [("U.S. 10Y yield", y_us), (f"{country} 10Y yield", y_fc),
                               ("U.S. tax rate", t_us), (f"{country} tax rate", t_fc)]
@@ -551,7 +661,7 @@ def main():
 
         inputs = {
             "Industry": industry, "Country": country, "Currency": ccy,
-            "Tax rate used": tax_choice, "Conversion": method,
+            "Tax rate used": tax_choice,
             "Generated": now_utc(),
         }
         export = pd.DataFrame(
@@ -610,7 +720,7 @@ def main():
             export.to_excel(xw, sheet_name="Selected project", index=False)
             if not all_df.empty:
                 all_df.to_excel(xw, sheet_name="All industries", index=False)
-            pd.DataFrame(source_rows(betas, bbb, taxes, ylds)).to_excel(xw, sheet_name="Sources", index=False)
+            pd.DataFrame(source_rows(betas, bbb, taxes, ylds, yinfo)).to_excel(xw, sheet_name="Sources", index=False)
         st.download_button("⬇️ Download full workbook (Excel)", buf.getvalue(),
                            "international_cost_of_capital.xlsx",
                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
@@ -655,18 +765,22 @@ def main():
 | WACC (USD) | {pct(1-w_d,1)} × {pct(r['ke_usd'],4)} + {pct(w_d,1)} × {pct(r['kd_usd'],4)} × (1 − {pct(tax)}) | {pct(r['wacc_usd'],4)} |
 | WACC ({ccy}) | {pct(1-w_d,1)} × {pct(r['ke_fc'],4)} + {pct(w_d,1)} × {pct(r['kd_fc'],4)} × (1 − {pct(tax)}) | {pct(r['wacc_fc'],4)} |
 """)
-        if method_key == "additive":
-            st.caption("Additive conversion selected: k_FC = k_USD + (y_FC − y_US).")
 
     # ---------------- Sources ----------------
     with tab_src:
         st.subheader("Data sources, dates and status")
-        st.table(pd.DataFrame(source_rows(betas, bbb, taxes, ylds)).set_index("Data"))
-        for name, d in [("Betas", betas), ("BBB spread", bbb), ("Tax rates", taxes), ("Yields", ylds)]:
+        st.table(pd.DataFrame(source_rows(betas, bbb, taxes, ylds, yinfo)).set_index("Data"))
+        for name, d in [("Betas", betas), ("BBB spread", bbb), ("Tax rates", taxes)]:
             if d.get("error"):
                 st.warning(f"{name}: {d['error']}")
-        with st.expander("10Y government yields (Trading Economics)"):
-            st.dataframe(y_df.assign(Yield=y_df["Yield"].map(lambda v: f"{v:.3%}")), width="stretch")
+        if ylds.get("error"):
+            st.info(ylds["error"])
+        for c, info in yinfo.items():
+            if info.get("error"):
+                st.warning(f"{c} yield: {info['error']}")
+        if not y_df.empty:
+            with st.expander("10Y government yields (Trading Economics bonds table)"):
+                st.dataframe(y_df.assign(Yield=y_df["Yield"].map(lambda v: f"{v:.4%}")), width="stretch")
         with st.expander("Corporate tax rates (OECD)"):
             st.dataframe(tax_df.assign(**{"Tax rate": tax_df["Tax rate"].map(lambda v: f"{v:.2%}")}),
                          width="stretch")
@@ -689,9 +803,13 @@ def colombia_row():
             f"WACC {pct(x['wacc_usd'],4)} / {pct(x['wacc_fc'],4)} (slides: 10.6486/19.1600; 13.6154; 8.5265/16.0670)"]
 
 
-def source_rows(betas, bbb, taxes, ylds):
-    y_df = ylds["df"]
-    y_dates = ", ".join(sorted(set(y_df["Date"].astype(str)))[:3]) if not y_df.empty else ""
+def source_rows(betas, bbb, taxes, ylds, yinfo):
+    rows = [
+        {"Data": f"10Y government yield — {c}", "Source": info.get("source") or "Trading Economics",
+         "URL": info.get("url", TE_BONDS_URL), "Data as of": info.get("date", ""),
+         "Fetched": info.get("fetched", ylds["fetched"]), "Status": status_badge(info["status"])}
+        for c, info in yinfo.items()
+    ]
     return [
         {"Data": "Industry unlevered betas", "Source": "Aswath Damodaran (NYU Stern) — betas.xls",
          "URL": BETAS_URL, "Data as of": betas["as_of"], "Fetched": betas["fetched"],
@@ -702,10 +820,7 @@ def source_rows(betas, bbb, taxes, ylds):
         {"Data": "Corporate tax rates (combined statutory CIT)",
          "Source": "OECD Corporate Tax Statistics (via OECD Data API)", "URL": OECD_PAGE_URL,
          "Data as of": taxes["as_of"], "Fetched": taxes["fetched"], "Status": status_badge(taxes["status"])},
-        {"Data": "10Y government bond yields", "Source": "Trading Economics — Bonds",
-         "URL": TE_BONDS_URL, "Data as of": y_dates, "Fetched": ylds["fetched"],
-         "Status": status_badge(ylds["status"])},
-    ]
+    ] + rows
 
 
 ABOUT_MD = r"""
@@ -719,7 +834,6 @@ ABOUT_MD = r"""
 4. **Foreign-currency rates.** USD rates are translated using the 10-year government yield differential
    as a proxy for the expected inflation differential (international Fisher effect / relative PPP):
    $1 + k^{FC} = (1 + k^{\$})\,\dfrac{1 + y_{FC}}{1 + y_{US}}$.
-   An additive approximation $k^{FC} \approx k^{\$} + (y_{FC} - y_{US})$ is available in the sidebar.
 5. **Foreign borrowing spread.** By default the same factor $F = (1+y_{FC})/(1+y_{US})$ is applied:
    $s^* = s \times F$ and $k_d^{FC} = y_{FC} + s^*$ (equivalent to $(1+k_d^{\$})F - 1$).
    If the override is on, $s^*$ is the manual value; this affects only foreign-currency results.
@@ -732,8 +846,9 @@ ABOUT_MD = r"""
 - The 10Y government yield differential is treated as the expected inflation / currency-depreciation
   differential. This is a simplification: local yields can include a sovereign default spread and term premia.
 - Tax rate = OECD *combined* (central + sub-central) statutory corporate income tax rate.
-- Yields are scraped from Trading Economics; if the site is unreachable the U.S. yield falls back to FRED
-  (DGS10) and other countries must be entered manually.
+- Yields come from Trading Economics. The /bonds table is loaded from a bot-protected endpoint, so when it is
+  blocked the app reads each country's own page (tradingeconomics.com/<country>/government-bond-yield),
+  which carries the same quote. The U.S. yield falls back to FRED (DGS10) if that also fails.
 - Data are cached for up to 6 hours (yields: 1 hour). Use **Refresh data** to re-fetch.
 """
 

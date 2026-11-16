@@ -11,9 +11,10 @@ A Streamlit app that compares a project's **cost of equity, cost of debt and WAC
   | Industry unlevered betas (U.S.) | Aswath Damodaran, [betas.xls](https://pages.stern.nyu.edu/~adamodar/pc/datasets/betas.xls), column *Unlevered beta* |
   | USD BBB spread | Damodaran, [ratings.html](https://pages.stern.nyu.edu/adamodar/New_Home_Page/datafile/ratings.html), Baa2/BBB, large non-financial service firms |
   | Corporate tax rates | [OECD Corporate Tax Statistics](https://www.oecd.org/en/publications/corporate-tax-statistics-2024_9c27d6e8-en/full-report/statutory-corporate-income-tax-rates_440f9286.html), combined statutory CIT rate, pulled from the OECD Data API (`DSD_TAX_CIT@DF_CIT`), latest year |
-  | 10-year government yields | [Trading Economics – Bonds](https://tradingeconomics.com/bonds) (scraped, no API key) |
+  | 10-year government yields | [Trading Economics – Bonds](https://tradingeconomics.com/bonds) (scraped, no API key). The bonds table is loaded from a bot-protected endpoint, so if it's blocked the app reads the same quote from each country's page, e.g. `tradingeconomics.com/colombia/government-bond-yield` |
 - **Inputs:** industry, target country, equity risk premium, target debt share.
-- **Manual overrides** for unlevered beta, U.S. and foreign tax rate, USD BBB spread, U.S. and foreign 10Y yields, and the foreign-currency BBB spread (when off, the app shows the automatic, implied spread).
+- **Type-over inputs:** every data field shows the fetched value in grey (beta, U.S. and foreign tax rates, U.S. and foreign 10Y yields, USD BBB spread). Typing a number overrides it; clearing the field returns to the fetched value. The foreign-currency BBB spread shows the automatic value s × F until a manual value is typed.
+- ERP and debt share are typed directly.
 - **Tax-rate switch:** use the U.S. or the selected country's rate. The same rate applies in both currencies.
 - **Side-by-side results** (USD vs. local currency), a step-by-step calculation table, an **all-industry comparison**, and **downloads** (CSV and a full Excel workbook).
 - **Built-in checks tab** that verifies the required properties live.
@@ -31,8 +32,6 @@ A Streamlit app that compares a project's **cost of equity, cost of debt and WAC
 | Foreign borrowing spread | auto: s* = s × F, with F = (1 + y_FC)/(1 + y_US); or manual override |
 | Foreign cost of debt | k_d,FC = y_FC + s* |
 | WACC | (1 − w_d) × k_e + w_d × k_d × (1 − t) |
-
-The sidebar also offers an additive approximation for the conversion: k_FC ≈ k$ + (y_FC − y_US).
 
 ### Assumptions
 - One tax rate, debt share and ERP are shared across both currencies.
