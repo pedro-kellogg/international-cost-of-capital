@@ -251,11 +251,11 @@ def parse_betas_xls(content: bytes) -> tuple[pd.DataFrame, str]:
         raise ValueError("Column 'Unlevered beta' not found in betas.xls")
     firms_col = cols.get("number of firms")
     out = pd.DataFrame({
-        "Industry": df[cols["industry name"]].astype(str).str.strip(),
+        "Industry": df[cols["industry name"]].map(lambda x: "" if pd.isna(x) else str(x).strip()),
         "Firms": pd.to_numeric(df[firms_col], errors="coerce") if firms_col else np.nan,
         "Unlevered beta": pd.to_numeric(df[ub_col], errors="coerce"),
     })
-    out = out[out["Unlevered beta"].notna() & (out["Industry"] != "nan")]
+    out = out[out["Unlevered beta"].notna() & (out["Industry"] != "")]
     out = out[~out["Industry"].str.lower().str.startswith("total market")]
     return out.reset_index(drop=True), as_of
 
@@ -272,9 +272,8 @@ def parse_ratings_html(html: str) -> tuple[float, str, str]:
 
     tables = pd.read_html(io.StringIO(html))
     for tbl in tables:  # first matching table is the large-firm table
-        flat = tbl.astype(str)
-        for _, row in flat.iterrows():
-            vals = [v.strip() for v in row.tolist()]
+        for _, row in tbl.iterrows():
+            vals = ["" if pd.isna(v) else str(v).strip() for v in row.tolist()]
             for j, v in enumerate(vals):
                 if v.replace(" ", "").lower() in ("baa2/bbb",):
                     for w in vals[j + 1:]:
@@ -349,7 +348,7 @@ def parse_oecd_csv(text: str) -> tuple[pd.DataFrame, str]:
     meas_lbl = [c for c in label_cols if "measure" in c.lower() and c not in ("MEASURE",)]
     mask = pd.Series(False, index=df.index)
     for c in meas_lbl + meas_cols:
-        mask |= df[c].astype(str).str.lower().str.contains("combined")
+        mask |= df[c].fillna("").astype(str).str.lower().str.contains("combined", regex=False)
     if mask.any():
         df = df[mask]
     # choose the dominant (non-targeted) category for any remaining dimensions
@@ -469,20 +468,18 @@ def pct(x: float, d: int = 2) -> str:
     return "—" if x is None or (isinstance(x, float) and np.isnan(x)) else f"{x * 100:.{d}f}%"
 
 
-def data_input(label, key, fetched, is_pct=True, min_v=-50.0, max_v=100.0, step=0.01, note="", tag="fetched"):
-    """Number field pre-filled (as a grey placeholder) with the fetched value.
-    Leave it blank to use the fetched value; type a number to override; clear it to go back.
-    Returns (value_used, is_manual)."""
+def data_input(label, key, fetched, source="", is_pct=True, min_v=-50.0, max_v=100.0, step=0.01):
+    """Number field showing the fetched value as a grey placeholder. Blank = fetched value;
+    a typed number overrides it. `source` is shown in the (?) tooltip. Returns (value_used, is_manual)."""
     have = fetched is not None and not (isinstance(fetched, float) and np.isnan(fetched))
     shown = (fetched * 100 if is_pct else fetched) if have else None
-    ph = f"{shown:.4f}  ({tag}{note})" if have else "not available — type a value"
-    v = st.number_input(f"{label} (%)" if is_pct else label, value=None, placeholder=ph, key=key,
-                        min_value=min_v, max_value=max_v, step=step, format="%.4f",
-                        help="Blank = use the value shown in grey. Type a number to override; "
-                             "delete it to go back.")
+    v = st.number_input(f"{label} (%)" if is_pct else label, value=None,
+                        placeholder=f"{shown:.4f}" if have else "not available — type a value",
+                        key=key, min_value=min_v, max_value=max_v, step=step, format="%.4f",
+                        help=source or None)
     if v is None:
         return (fetched if have else np.nan), False
-    st.caption(f"✏️ Manual — {tag} value: {shown:.4f}" if have else "✏️ Manual")
+    st.caption(f"✏️ Manual (fetched: {shown:.4f})" if have else "✏️ Manual")
     return (v / 100 if is_pct else v), True
 
 
@@ -536,12 +533,17 @@ def main():
 
     sb.header("Data inputs")
     sb.caption("Grey values are fetched. Type over any of them to override; clear the field to go back.")
+    tax_note = f"OECD Corporate Tax Statistics — combined statutory CIT rate, {taxes['as_of']} (OECD Data API)."
     is_us = country == "United States"
     auto_beta = float(beta_df.loc[beta_df["Industry"] == industry, "Unlevered beta"].iloc[0]) \
         if industry in set(beta_df["Industry"]) else np.nan
+    n_firms = beta_df.loc[beta_df["Industry"] == industry, "Firms"]
+    n_firms = f", {int(n_firms.iloc[0])} firms" if len(n_firms) and pd.notna(n_firms.iloc[0]) else ""
     with sb:
         beta_u, ov_beta = data_input("Unlevered beta", f"beta|{industry}", auto_beta, is_pct=False,
-                                     min_v=0.0, max_v=5.0)
+                                     min_v=0.0, max_v=5.0,
+                                     source=f"Damodaran betas.xls, column 'Unlevered beta' — {industry}{n_firms}. "
+                                            f"{betas['as_of']}.")
     if np.isnan(beta_u):
         sb.error("Beta data unavailable — type an unlevered beta.")
         st.stop()
@@ -559,35 +561,38 @@ def main():
 
     with sb.expander("Corporate tax rates (OECD)", expanded=False):
         t_us, ov_tus = data_input("U.S. tax rate", "tax|United States", tax_map.get("United States", np.nan),
-                                  min_v=0.0)
+                                  min_v=0.0, source=tax_note)
         if is_us:
             t_fc, ov_tfc = t_us, False
         else:
             t_fc, ov_tfc = data_input(f"{country} tax rate", f"tax|{country}", tax_map.get(country, np.nan),
-                                      min_v=0.0)
+                                      min_v=0.0, source=tax_note)
 
     with sb.expander("10Y government yields (Trading Economics)", expanded=False):
+        def ysrc(info):
+            if info["status"] == "failed":
+                return "Could not fetch — type a value. " + info.get("error", "")
+            return f"{info['value']:.4%} · {info['date']} · {info['source']}"
+
         d_us = yinfo["United States"]
-        y_us, ov_yus = data_input("U.S. 10Y yield", "yield|United States", d_us["value"],
-                                  note=f", {d_us['date']}" if d_us.get("date") else "")
+        y_us, ov_yus = data_input("U.S. 10Y yield", "yield|United States", d_us["value"], source=ysrc(d_us))
         if is_us:
             y_fc, ov_yfc = y_us, False
             st.caption("Selected country is the U.S.: its yield equals the U.S. yield.")
         else:
             d_fc = yinfo[country]
-            y_fc, ov_yfc = data_input(f"{country} 10Y yield", f"yield|{country}", d_fc["value"],
-                                      note=f", {d_fc['date']}" if d_fc.get("date") else "")
-        for c, info in yinfo.items():
-            if info["status"] != "failed":
-                st.caption(f"{c}: {info['value']:.4%} · {info['date']} · {info['source']}")
+            y_fc, ov_yfc = data_input(f"{country} 10Y yield", f"yield|{country}", d_fc["value"], source=ysrc(d_fc))
 
     with sb.expander("BBB borrowing spreads", expanded=False):
         s_usd, ov_susd = data_input("USD BBB spread", "spread|USD", bbb["value"], min_v=0.0,
-                                    note=f", Damodaran {bbb['as_of']}" if bbb.get("as_of") else "")
+                                    source=f"Damodaran ratings.html — {bbb['label']} spread, large non-financial "
+                                           f"service firms, {bbb['as_of']}.")
         have_y = not (np.isnan(y_us) or np.isnan(y_fc))
         s_fc_auto = s_usd * (1 + y_fc) / (1 + y_us) if have_y else np.nan
+        fac = (1 + y_fc) / (1 + y_us) if have_y else np.nan
         s_fc_val, ov_sfc = data_input(f"{ccy} BBB spread", f"spread|{country}", s_fc_auto, min_v=0.0,
-                                      tag="auto", note=": s × F")
+                                      source=f"Auto: s* = s × F, with F = (1 + y_FC)/(1 + y_US) = {fac:.6f}. "
+                                             "Type a value to override; clear it to switch back to auto.")
         s_fc_in = s_fc_val if ov_sfc else None
 
     missing = [n for n, v in [("U.S. 10Y yield", y_us), (f"{country} 10Y yield", y_fc),
@@ -609,8 +614,8 @@ def main():
     c3.metric("WACC (USD)", pct(r["wacc_usd"]))
     c4.metric(f"WACC ({ccy})", pct(r["wacc_fc"]), f"{(r['wacc_fc'] - r['wacc_usd']) * 1e4:+.0f} bp vs USD")
 
-    tab_res, tab_all, tab_check, tab_src, tab_about = st.tabs(
-        ["📊 Results", "🏭 All industries", "✅ Checks", "📚 Sources & data", "ℹ️ Method & assumptions"])
+    tab_res, tab_all, tab_src, tab_about = st.tabs(
+        ["📊 Results", "🏭 All industries", "📚 Sources & data", "ℹ️ Method & assumptions"])
 
     # ---------------- Results ----------------
     with tab_res:
@@ -623,20 +628,36 @@ def main():
                 ["Debt / Equity", f"{r['de']:.4f}", f"{r['de']:.4f}"],
                 ["Levered beta", f"{r['beta_l']:.4f}", f"{r['beta_l']:.4f}"],
                 ["Equity risk premium", pct(r["erp"]), "(implied by conversion)"],
-                ["**Cost of equity**", pct(r["ke_usd"]), pct(r["ke_fc"])],
+                ["Cost of equity", pct(r["ke_usd"]), pct(r["ke_fc"])],
                 ["BBB spread", pct(r["spread_usd"]),
                  pct(r["spread_fc"]) + (" (manual)" if ov_sfc else " (auto)")],
                 ["Pre-tax cost of debt", pct(r["kd_usd"]), pct(r["kd_fc"])],
                 ["After-tax cost of debt", pct(r["kd_usd_at"]), pct(r["kd_fc_at"])],
                 ["Equity weight", pct(r["w_e"], 1), pct(r["w_e"], 1)],
                 ["Debt weight", pct(r["w_d"], 1), pct(r["w_d"], 1)],
-                ["**WACC**", pct(r["wacc_usd"]), pct(r["wacc_fc"])],
+                ["WACC", pct(r["wacc_usd"]), pct(r["wacc_fc"])],
             ],
             columns=["Item", "USD", ccy],
         )
         st.table(tbl.set_index("Item"))
         if ov_sfc:
             st.caption(f"Auto {ccy} spread would have been {pct(r['spread_fc_auto'])}.")
+        with st.expander("Calculation steps"):
+            st.markdown(f"""
+| Step | Formula | Value |
+|---|---|---|
+| D/E | {pct(w_d,1)} / {pct(1-w_d,1)} | {r['de']:.4f} |
+| Levered beta | {r['beta_u']:.4f} × [1 + (1 − {pct(tax)}) × {r['de']:.4f}] | {r['beta_l']:.4f} |
+| k_e (USD) | {pct(y_us)} + {r['beta_l']:.4f} × {pct(erp)} | {pct(r['ke_usd'],4)} |
+| k_d (USD) | {pct(y_us)} + {pct(r['spread_usd'])} | {pct(r['kd_usd'],4)} |
+| F | (1 + {pct(y_fc,3)}) / (1 + {pct(y_us,3)}) | {r['factor']:.7f} |
+| k_e ({ccy}) | (1 + {pct(r['ke_usd'],4)}) × {r['factor']:.7f} − 1 | {pct(r['ke_fc'],4)} |
+| s* ({ccy}) | {"manual override" if ov_sfc else f"{pct(r['spread_usd'],4)} × {r['factor']:.7f}"} | {pct(r['spread_fc'],4)} |
+| k_d ({ccy}) | {pct(y_fc,3)} + {pct(r['spread_fc'],4)} | {pct(r['kd_fc'],4)} |
+| WACC (USD) | {pct(1-w_d,1)} × {pct(r['ke_usd'],4)} + {pct(w_d,1)} × {pct(r['kd_usd'],4)} × (1 − {pct(tax)}) | {pct(r['wacc_usd'],4)} |
+| WACC ({ccy}) | {pct(1-w_d,1)} × {pct(r['ke_fc'],4)} + {pct(w_d,1)} × {pct(r['kd_fc'],4)} × (1 − {pct(tax)}) | {pct(r['wacc_fc'],4)} |
+""")
+
 
         flags = [n for n, f in [("beta", ov_beta), ("U.S. tax", ov_tus), (f"{country} tax", ov_tfc),
                                 ("USD spread", ov_susd), (f"{ccy} spread", ov_sfc),
@@ -725,47 +746,6 @@ def main():
                            "international_cost_of_capital.xlsx",
                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-    # ---------------- Checks ----------------
-    with tab_check:
-        st.subheader("Built-in verification (uses current inputs)")
-        base = dict(beta_u=beta_u, tax=tax, debt_share=w_d, erp=erp, y_us=y_us, spread_usd=s_usd, method=method_key)
-        a = compute(**base, y_fc=y_us)
-        c1_ok = abs(a["ke_usd"] - a["ke_fc"]) < 1e-12 and abs(a["wacc_usd"] - a["wacc_fc"]) < 1e-12 \
-            and abs(a["kd_usd"] - a["kd_fc"]) < 1e-12
-        b = compute(**{**base, "debt_share": 0.0}, y_fc=y_fc)
-        c2_ok = abs(b["wacc_usd"] - b["ke_usd"]) < 1e-12 and abs(b["wacc_fc"] - b["ke_fc"]) < 1e-12
-        c0 = compute(**base, y_fc=y_fc)
-        c1x = compute(**base, y_fc=y_fc, spread_fc_override=0.05)
-        c3_ok = all(abs(c0[k] - c1x[k]) < 1e-12 for k in ("ke_usd", "kd_usd", "wacc_usd"))
-        checks = pd.DataFrame([
-            ["Equal yields (y_FC = y_US), foreign-spread override off → identical results",
-             "✅ pass" if c1_ok else "❌ fail",
-             f"k_e {pct(a['ke_usd'], 4)} vs {pct(a['ke_fc'], 4)}; WACC {pct(a['wacc_usd'], 4)} vs {pct(a['wacc_fc'], 4)}"],
-            ["Zero debt → WACC = cost of equity", "✅ pass" if c2_ok else "❌ fail",
-             f"USD {pct(b['wacc_usd'], 4)} = {pct(b['ke_usd'], 4)}; {ccy} {pct(b['wacc_fc'], 4)} = {pct(b['ke_fc'], 4)}"],
-            ["Overriding the foreign spread (to 5%) leaves USD results unchanged",
-             "✅ pass" if c3_ok else "❌ fail",
-             f"USD WACC {pct(c0['wacc_usd'], 4)} vs {pct(c1x['wacc_usd'], 4)}"],
-            colombia_row(),
-        ], columns=["Check", "Result", "Detail"])
-        st.table(checks.set_index("Check"))
-
-        st.subheader("Step-by-step for the current selection")
-        st.markdown(f"""
-| Step | Formula | Value |
-|---|---|---|
-| D/E | {pct(w_d,1)} / {pct(1-w_d,1)} | {r['de']:.4f} |
-| Levered beta | {r['beta_u']:.4f} × [1 + (1 − {pct(tax)}) × {r['de']:.4f}] | {r['beta_l']:.4f} |
-| k_e (USD) | {pct(y_us)} + {r['beta_l']:.4f} × {pct(erp)} | {pct(r['ke_usd'],4)} |
-| k_d (USD) | {pct(y_us)} + {pct(r['spread_usd'])} | {pct(r['kd_usd'],4)} |
-| F | (1 + {pct(y_fc,3)}) / (1 + {pct(y_us,3)}) | {r['factor']:.7f} |
-| k_e ({ccy}) | (1 + {pct(r['ke_usd'],4)}) × {r['factor']:.7f} − 1 | {pct(r['ke_fc'],4)} |
-| s* ({ccy}) | {"manual override" if ov_sfc else f"{pct(r['spread_usd'],4)} × {r['factor']:.7f}"} | {pct(r['spread_fc'],4)} |
-| k_d ({ccy}) | {pct(y_fc,3)} + {pct(r['spread_fc'],4)} | {pct(r['kd_fc'],4)} |
-| WACC (USD) | {pct(1-w_d,1)} × {pct(r['ke_usd'],4)} + {pct(w_d,1)} × {pct(r['kd_usd'],4)} × (1 − {pct(tax)}) | {pct(r['wacc_usd'],4)} |
-| WACC ({ccy}) | {pct(1-w_d,1)} × {pct(r['ke_fc'],4)} + {pct(w_d,1)} × {pct(r['kd_fc'],4)} × (1 − {pct(tax)}) | {pct(r['wacc_fc'],4)} |
-""")
-
     # ---------------- Sources ----------------
     with tab_src:
         st.subheader("Data sources, dates and status")
@@ -773,8 +753,10 @@ def main():
         for name, d in [("Betas", betas), ("BBB spread", bbb), ("Tax rates", taxes)]:
             if d.get("error"):
                 st.warning(f"{name}: {d['error']}")
-        if ylds.get("error"):
-            st.info(ylds["error"])
+        if ylds.get("mode") == "per-country":
+            st.caption("Yields are read from each country's Trading Economics page "
+                       "(tradingeconomics.com/<country>/government-bond-yield). The /bonds overview table is "
+                       "loaded by a bot-protected script, so the app uses the country pages, which show the same quote.")
         for c, info in yinfo.items():
             if info.get("error"):
                 st.warning(f"{c} yield: {info['error']}")
@@ -790,17 +772,6 @@ def main():
     # ---------------- About ----------------
     with tab_about:
         st.markdown(ABOUT_MD)
-
-
-def colombia_row():
-    """Reproduce the in-class Colombia example (slide values)."""
-    x = compute(0.80, 0.35, 0.30, 0.065, 0.04, 0.12, 0.015)
-    target = dict(ke_usd=0.106486, wacc_usd=0.085265, ke_fc=0.191600, kd_fc=0.136154, wacc_fc=0.160670)
-    ok = all(abs(x[k] - v) < 5e-7 for k, v in target.items())
-    return ["Class example — Colombia (β_U 0.80, d 30%, τ 35%, ERP 6.5%, y 4%/12%, s 1.5%)",
-            "✅ pass" if ok else "❌ fail",
-            f"k_e {pct(x['ke_usd'],4)} / {pct(x['ke_fc'],4)}; k_d* {pct(x['kd_fc'],4)}; "
-            f"WACC {pct(x['wacc_usd'],4)} / {pct(x['wacc_fc'],4)} (slides: 10.6486/19.1600; 13.6154; 8.5265/16.0670)"]
 
 
 def source_rows(betas, bbb, taxes, ylds, yinfo):
@@ -824,32 +795,30 @@ def source_rows(betas, bbb, taxes, ylds, yinfo):
 
 
 ABOUT_MD = r"""
-### Method
+### Method (class notation; * denotes the foreign currency)
 
-1. **Levered beta (Hamada).** $\beta_L = \beta_U\,[1 + (1-t)\,D/E]$, with $D/E = w_d/(1-w_d)$.
-   $\beta_U$ is Damodaran's U.S. industry *unlevered beta*.
-2. **USD cost of equity (CAPM).** $k_e^{\$} = y_{US} + \beta_L \times ERP$.
-3. **USD cost of debt.** $k_d^{\$} = y_{US} + s_{BBB}$, where $s_{BBB}$ is Damodaran's Baa2/BBB spread
-   for large non-financial firms.
-4. **Foreign-currency rates.** USD rates are translated using the 10-year government yield differential
-   as a proxy for the expected inflation differential (international Fisher effect / relative PPP):
-   $1 + k^{FC} = (1 + k^{\$})\,\dfrac{1 + y_{FC}}{1 + y_{US}}$.
-5. **Foreign borrowing spread.** By default the same factor $F = (1+y_{FC})/(1+y_{US})$ is applied:
-   $s^* = s \times F$ and $k_d^{FC} = y_{FC} + s^*$ (equivalent to $(1+k_d^{\$})F - 1$).
-   If the override is on, $s^*$ is the manual value; this affects only foreign-currency results.
-6. **WACC.** $WACC = (1-w_d)\,k_e + w_d\,k_d\,(1-t)$, in each currency.
+1. **Relever the beta.** $D/E = d/(1-d)$ and $\beta_E = \beta_U\,[1 + (1-\tau)\,D/E]$.
+   $\beta_U$ is Damodaran's U.S. industry unlevered beta.
+2. **Cost of equity in USD (CAPM).** $R_e = R_f + \beta_E \times ERP$, with the U.S. 10-year yield as $R_f$.
+3. **Cost of debt in USD.** $R_d = R_f + s$, where $s$ is Damodaran's Baa2/BBB spread for large
+   non-financial firms.
+4. **Conversion factor.** $F = (1 + R_f^*)/(1 + R_f)$, using the selected country's 10-year yield as $R_f^*$
+   (Fisher equation + relative PPP).
+5. **Cost of equity in foreign currency.** $1 + R_e^* = (1 + R_e) \times F$.
+6. **Cost of debt in foreign currency.** $s^* = s \times F$ and $R_d^* = R_f^* + s^*$.
+   A manual foreign spread replaces $s^*$ and changes only the foreign-currency results.
+7. **WACC** in each currency: $WACC = (1-d)\,R_e + d\,R_d\,(1-\tau)$.
 
 ### Key assumptions
-- The **same** tax rate (U.S. or selected country — toggle), debt share and ERP are used in both currencies.
-- The project's risk is captured by the U.S. industry beta; no separate country-risk premium is added —
-  country risk enters only through the local government yield (which can embed sovereign default risk).
-- The 10Y government yield differential is treated as the expected inflation / currency-depreciation
-  differential. This is a simplification: local yields can include a sovereign default spread and term premia.
-- Tax rate = OECD *combined* (central + sub-central) statutory corporate income tax rate.
-- Yields come from Trading Economics. The /bonds table is loaded from a bot-protected endpoint, so when it is
-  blocked the app reads each country's own page (tradingeconomics.com/<country>/government-bond-yield),
-  which carries the same quote. The U.S. yield falls back to FRED (DGS10) if that also fails.
-- Data are cached for up to 6 hours (yields: 1 hour). Use **Refresh data** to re-fetch.
+- The same tax rate $\tau$ (U.S. or selected country, chosen in the sidebar), debt share $d$ and ERP are
+  used in both currencies; interest is deducted in each financing currency.
+- Project risk is the U.S. industry's business risk. No separate country equity risk premium is added;
+  country risk enters only through the local government yield.
+- Debt and the interest tax shield are assumed to have zero beta (basis for the relevering formula).
+- The 10-year government yield differential proxies the expected inflation / depreciation differential.
+  Local yields can also include sovereign default and term premia.
+- Tax rate = OECD combined (central + sub-central) statutory corporate income tax rate.
+- Data are cached (yields 1 hour, other sources 6 hours). Use **Refresh data** to re-fetch.
 """
 
 

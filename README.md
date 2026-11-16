@@ -16,8 +16,7 @@ A Streamlit app that compares a project's **cost of equity, cost of debt and WAC
 - **Type-over inputs:** every data field shows the fetched value in grey (beta, U.S. and foreign tax rates, U.S. and foreign 10Y yields, USD BBB spread). Typing a number overrides it; clearing the field returns to the fetched value. The foreign-currency BBB spread shows the automatic value s × F until a manual value is typed.
 - ERP and debt share are typed directly.
 - **Tax-rate switch:** use the U.S. or the selected country's rate. The same rate applies in both currencies.
-- **Side-by-side results** (USD vs. local currency), a step-by-step calculation table, an **all-industry comparison**, and **downloads** (CSV and a full Excel workbook).
-- **Built-in checks tab** that verifies the required properties live.
+- **Side-by-side results** (USD vs. local currency), a step-by-step calculation table, an **all-industry comparison**, and **downloads** (CSV and a full Excel workbook). The Results tab also has a *Calculation steps* section showing every intermediate number.
 
 **Defaults:** Software (System & Application) · United States · U.S. tax rate · ERP 6.5% · 30% debt.
 
@@ -39,7 +38,7 @@ A Streamlit app that compares a project's **cost of equity, cost of debt and WAC
 - The 10Y yield differential is used as a proxy for the expected inflation/depreciation differential. Local yields may also contain sovereign default and term premia.
 - If a source can't be reached, the app says so: the BBB spread and tax rates fall back to a dated snapshot, the U.S. yield falls back to FRED (DGS10), and other inputs can be entered manually.
 
-## Verification (also in the app's ✅ Checks tab)
+## Verification
 0. Reproduces the in-class Colombia example: k_e 10.6486% / 19.1600%, k_d* 13.6154%, WACC 8.5265% / 16.0670%.
 1. Equal government yields with the foreign-spread override off give identical USD and foreign results.
 2. Zero debt makes WACC equal to the cost of equity.
